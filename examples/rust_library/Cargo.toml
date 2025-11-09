@@ -1,0 +1,25 @@
+[package]
+name = "example_parser_library"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "parser"
+path = "src/lib.rs"
+
+# Fuzzing support
+[features]
+default = []
+fuzzing = ["afl"]
+
+[dependencies]
+afl = { version = "0.4", optional = true }
+
+# Fuzzing target binary
+[[bin]]
+name = "fuzz_parser"
+path = "fuzz/main.rs"
+required-features = ["fuzzing"]
+
+[dev-dependencies]
+# Add test dependencies here

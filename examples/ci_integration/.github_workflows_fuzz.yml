@@ -1,0 +1,279 @@
+# GitHub Actions Workflow for Continuous Fuzzing
+#
+# Copy this file to: .github/workflows/fuzz.yml
+
+name: Continuous Fuzzing
+
+on:
+  # Run on schedule (daily)
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM UTC daily
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzzing duration in seconds'
+        required: false
+        default: '3600'
+
+  # Run on pull requests (quick fuzz test)
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  # Quick fuzzing test on PRs
+  quick-fuzz:
+    name: Quick Fuzz Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install AFL
+        run: cargo install afl
+
+      - name: Build fuzz target
+        run: |
+          cd fuzz  # or your fuzzing directory
+          cargo afl build --release --features fuzzing
+
+      - name: Quick fuzz (5 minutes)
+        run: |
+          timeout 300 cargo afl fuzz \
+            -i corpus/initial \
+            -o findings \
+            target/release/fuzz_target || true
+
+      - name: Check for crashes
+        run: |
+          if [ -d findings/crashes ] && [ "$(find findings/crashes -type f ! -name 'README.txt' | wc -l)" -gt 0 ]; then
+            echo "❌ Fuzzing found crashes!"
+            find findings/crashes -type f ! -name 'README.txt' -exec basename {} \;
+            exit 1
+          else
+            echo "✅ No crashes found in quick fuzz test"
+          fi
+
+  # Extended fuzzing on schedule
+  extended-fuzz:
+    name: Extended Fuzz Session
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    strategy:
+      matrix:
+        target: [fuzz_target_1, fuzz_target_2]  # Add your fuzz targets
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install AFL
+        run: cargo install afl
+
+      - name: Build fuzz target
+        run: cargo afl build --release --features fuzzing
+
+      - name: Download previous corpus
+        uses: actions/cache@v3
+        with:
+          path: corpus
+          key: corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            corpus-${{ matrix.target }}-
+
+      - name: Extended fuzzing
+        run: |
+          DURATION=${{ github.event.inputs.duration || '3600' }}
+          echo "Fuzzing for ${DURATION} seconds..."
+
+          timeout ${DURATION} cargo afl fuzz \
+            -i corpus/initial \
+            -o findings \
+            target/release/${{ matrix.target }} || true
+
+      - name: Save corpus
+        uses: actions/cache@v3
+        with:
+          path: corpus
+          key: corpus-${{ matrix.target }}-${{ github.sha }}
+
+      - name: Collect findings
+        if: always()
+        run: |
+          mkdir -p artifacts/${{ matrix.target }}
+
+          # Copy crashes
+          if [ -d findings/crashes ]; then
+            cp -r findings/crashes artifacts/${{ matrix.target }}/
+          fi
+
+          # Copy hangs
+          if [ -d findings/hangs ]; then
+            cp -r findings/hangs artifacts/${{ matrix.target }}/
+          fi
+
+          # Copy stats
+          if [ -f findings/fuzzer_stats ]; then
+            cp findings/fuzzer_stats artifacts/${{ matrix.target }}/
+          fi
+
+          # Generate report
+          cat > artifacts/${{ matrix.target }}/report.md << EOF
+          # Fuzzing Report: ${{ matrix.target }}
+
+          **Date:** $(date)
+          **Duration:** ${{ github.event.inputs.duration || '3600' }} seconds
+          **Target:** ${{ matrix.target }}
+
+          ## Statistics
+
+          \`\`\`
+          $(cat findings/fuzzer_stats 2>/dev/null || echo "No stats available")
+          \`\`\`
+
+          ## Crashes
+
+          $(find findings/crashes -type f ! -name 'README.txt' 2>/dev/null | wc -l) crashes found
+
+          ## Hangs
+
+          $(find findings/hangs -type f ! -name 'README.txt' 2>/dev/null | wc -l) hangs found
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: fuzzing-results-${{ matrix.target }}
+          path: artifacts/${{ matrix.target }}
+
+      - name: Create issue if crashes found
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const crashDir = 'findings/crashes';
+
+            if (fs.existsSync(crashDir)) {
+              const crashes = fs.readdirSync(crashDir)
+                .filter(f => f !== 'README.txt');
+
+              if (crashes.length > 0) {
+                const issue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `🐛 Fuzzing found ${crashes.length} crash(es) in ${{ matrix.target }}`,
+                  body: `
+          ## Fuzzing Crashes Detected
+
+          **Target:** ${{ matrix.target }}
+          **Run:** ${{ github.run_id }}
+          **Date:** ${new Date().toISOString()}
+
+          ### Summary
+          - **Crashes found:** ${crashes.length}
+          - **Fuzzing duration:** ${{ github.event.inputs.duration || '3600' }} seconds
+
+          ### Crash Files
+          ${crashes.map(c => `- \`${c}\``).join('\n')}
+
+          ### Next Steps
+          1. Download artifacts from the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          2. Reproduce crashes locally
+          3. Investigate and fix bugs
+          4. Re-run fuzzer to verify fixes
+
+          ### Reproduce Locally
+          \`\`\`bash
+          # Download crash from artifacts
+          cat crash_file | cargo run --bin ${{ matrix.target }}
+          \`\`\`
+                  `,
+                  labels: ['bug', 'security', 'fuzzing']
+                });
+
+                console.log(`Created issue #${issue.data.number}`);
+              }
+            }
+
+  # Summary job
+  fuzzing-summary:
+    name: Fuzzing Summary
+    runs-on: ubuntu-latest
+    needs: [extended-fuzz]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate summary
+        run: |
+          echo "# 🔍 Fuzzing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          total_crashes=0
+          total_hangs=0
+
+          for dir in fuzzing-results-*/; do
+            if [ -d "$dir" ]; then
+              target=$(basename "$dir" | sed 's/fuzzing-results-//')
+              crashes=$(find "$dir/crashes" -type f ! -name 'README.txt' 2>/dev/null | wc -l)
+              hangs=$(find "$dir/hangs" -type f ! -name 'README.txt' 2>/dev/null | wc -l)
+
+              total_crashes=$((total_crashes + crashes))
+              total_hangs=$((total_hangs + hangs))
+
+              echo "## $target" >> $GITHUB_STEP_SUMMARY
+              echo "- 💥 Crashes: $crashes" >> $GITHUB_STEP_SUMMARY
+              echo "- ⏸️ Hangs: $hangs" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Crashes:** $total_crashes" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Hangs:** $total_hangs" >> $GITHUB_STEP_SUMMARY
+
+          if [ $total_crashes -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Action Required:** Review and fix crashes" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **No crashes found!**" >> $GITHUB_STEP_SUMMARY
+          fi

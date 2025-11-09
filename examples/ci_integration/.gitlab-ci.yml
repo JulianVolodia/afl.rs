@@ -1,0 +1,215 @@
+# GitLab CI/CD Pipeline for Continuous Fuzzing
+#
+# Copy this file to: .gitlab-ci.yml
+
+stages:
+  - build
+  - fuzz
+  - analyze
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  AFL_VERSION: "0.4"
+
+# Cache for faster builds
+.cache_template: &cache_configuration
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cargo/
+      - target/
+      - corpus/
+
+# Build fuzzing targets
+build:fuzz:
+  stage: build
+  image: rust:latest
+  <<: *cache_configuration
+  script:
+    - rustc --version
+    - cargo --version
+    - cargo install afl
+    - cargo afl build --release --features fuzzing
+  artifacts:
+    paths:
+      - target/release/fuzz_*
+    expire_in: 1 hour
+
+# Quick fuzz test on merge requests
+fuzz:quick:
+  stage: fuzz
+  image: rust:latest
+  <<: *cache_configuration
+  needs: ["build:fuzz"]
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+  script:
+    - cargo install afl
+    - |
+      # Quick 5-minute fuzz
+      timeout 300 cargo afl fuzz \
+        -i corpus/initial \
+        -o findings \
+        target/release/fuzz_target || true
+    - |
+      # Check for crashes
+      if [ -d findings/crashes ]; then
+        crash_count=$(find findings/crashes -type f ! -name 'README.txt' | wc -l)
+        if [ $crash_count -gt 0 ]; then
+          echo "Found $crash_count crashes!"
+          exit 1
+        fi
+      fi
+  artifacts:
+    when: always
+    paths:
+      - findings/
+    expire_in: 1 week
+
+# Extended fuzzing (scheduled)
+fuzz:extended:
+  stage: fuzz
+  image: rust:latest
+  <<: *cache_configuration
+  needs: ["build:fuzz"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  parallel:
+    matrix:
+      - TARGET: [fuzz_target_1, fuzz_target_2]
+  script:
+    - cargo install afl
+    - |
+      # Restore previous corpus if available
+      if [ -d "corpus_$TARGET" ]; then
+        cp -r "corpus_$TARGET"/* corpus/initial/ 2>/dev/null || true
+      fi
+    - |
+      # Extended fuzzing (1 hour)
+      timeout 3600 cargo afl fuzz \
+        -i corpus/initial \
+        -o findings_$TARGET \
+        target/release/$TARGET || true
+    - |
+      # Update corpus
+      mkdir -p "corpus_$TARGET"
+      cp -r findings_$TARGET/queue/* "corpus_$TARGET/" 2>/dev/null || true
+  artifacts:
+    when: always
+    paths:
+      - findings_*/
+      - corpus_*/
+    expire_in: 1 month
+
+# Analyze results
+analyze:crashes:
+  stage: analyze
+  image: rust:latest
+  needs: ["fuzz:extended"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - |
+      # Count all crashes
+      total_crashes=0
+      for dir in findings_*/crashes; do
+        if [ -d "$dir" ]; then
+          count=$(find "$dir" -type f ! -name 'README.txt' | wc -l)
+          total_crashes=$((total_crashes + count))
+          echo "Found $count crashes in $dir"
+        fi
+      done
+
+      echo "Total crashes: $total_crashes"
+
+      # Generate report
+      cat > fuzzing_report.md << EOF
+      # Fuzzing Report
+
+      **Date:** $(date)
+      **Pipeline:** $CI_PIPELINE_ID
+      **Commit:** $CI_COMMIT_SHA
+
+      ## Summary
+      - Total crashes found: $total_crashes
+      - Fuzzing duration: 1 hour per target
+
+      ## Details
+      EOF
+
+      for dir in findings_*/; do
+        target=$(basename "$dir" | sed 's/findings_//')
+        crashes=$(find "$dir/crashes" -type f ! -name 'README.txt' 2>/dev/null | wc -l)
+        hangs=$(find "$dir/hangs" -type f ! -name 'README.txt' 2>/dev/null | wc -l)
+
+        cat >> fuzzing_report.md << EOF
+
+      ### Target: $target
+      - Crashes: $crashes
+      - Hangs: $hangs
+
+      EOF
+
+        if [ $crashes -gt 0 ]; then
+          echo "#### Crash Files" >> fuzzing_report.md
+          find "$dir/crashes" -type f ! -name 'README.txt' | while read crash; do
+            echo "- \`$(basename "$crash")\`" >> fuzzing_report.md
+          done
+        fi
+      done
+
+      # Create issue if crashes found
+      if [ $total_crashes -gt 0 ]; then
+        # Note: Requires GitLab API token with issue creation permissions
+        if [ -n "$GITLAB_API_TOKEN" ]; then
+          curl --request POST \
+            --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+            --data "title=Fuzzing found $total_crashes crash(es)" \
+            --data "description=$(cat fuzzing_report.md)" \
+            --data "labels=bug,security,fuzzing" \
+            "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues"
+        fi
+      fi
+
+  artifacts:
+    when: always
+    paths:
+      - fuzzing_report.md
+    expire_in: 1 month
+  allow_failure: true
+
+# Minimize crashes
+minimize:crashes:
+  stage: analyze
+  image: rust:latest
+  needs: ["fuzz:extended"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - cargo install afl
+    - |
+      mkdir -p minimized_crashes
+
+      # Minimize each crash
+      for findings_dir in findings_*/; do
+        target=$(basename "$findings_dir" | sed 's/findings_//')
+        crash_dir="$findings_dir/crashes"
+
+        if [ -d "$crash_dir" ]; then
+          find "$crash_dir" -type f ! -name 'README.txt' | while read crash; do
+            crash_name=$(basename "$crash")
+            echo "Minimizing: $crash_name"
+
+            cargo afl tmin \
+              -i "$crash" \
+              -o "minimized_crashes/${target}_${crash_name}" \
+              target/release/$target || true
+          done
+        fi
+      done
+  artifacts:
+    when: always
+    paths:
+      - minimized_crashes/
+    expire_in: 1 month
+  allow_failure: true
